@@ -1,4 +1,5 @@
 streamlit>=1.28.0
+langgraph>=0.0.40
 langchain>=0.1.0
 langchain-community>=0.0.20
 langchain-groq>=0.1.0
@@ -6,6 +7,10 @@ langchain-openai>=0.0.5
 duckduckgo-search>=4.0.0
 wikipedia>=1.4.0
 arxiv>=2.0.0
-python-dotenv>=1.0.0
 faiss-cpu>=1.7.4
+openai>=1.0.0
+python-dotenv>=1.0.0
+typing-extensions>=4.0.0
+tiktoken>=0.5.0
+numpy>=1.24.0
 requests>=2.31.0
