@@ -1,288 +1,375 @@
 import streamlit as st
-import requests
-import json
-import time
-from typing import Dict, Any, Optional
+from langchain_community.tools import WikipediaQueryRun, ArxivQueryRun
+from langchain_community.utilities import WikipediaAPIWrapper, ArxivAPIWrapper
+from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_groq import ChatGroq
+from langchain.agents import initialize_agent, AgentType
+from langchain.callbacks import StreamlitCallbackHandler
+import os
+from dotenv import load_dotenv
+import traceback
+from datetime import datetime
 import re
+
+# Load environment variables
+load_dotenv()
 
 # Page configuration
 st.set_page_config(
-    page_title="CodeGuru - Local Code Assistant",
-    page_icon="💻",
+    page_title="🔎 LangChain Search Agent",
+    page_icon="🔍",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for better code formatting and dark theme
+# Custom CSS styling
 st.markdown("""
 <style>
-    .stApp {
-        background-color: #0e1117;
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        background: linear-gradient(90deg, #FF6B6B, #4ECDC4, #45B7D1);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+        text-align: center;
+        margin-bottom: 1rem;
     }
     
     .chat-message {
         padding: 1rem;
-        border-radius: 0.5rem;
-        margin: 1rem 0;
-        border-left: 4px solid #4CAF50;
-        background-color: #1e2329;
+        border-radius: 10px;
+        margin: 0.5rem 0;
+        border-left: 4px solid #4ECDC4;
+        background-color: #f8f9fa;
     }
     
     .user-message {
-        border-left-color: #2196F3;
-        background-color: #262730;
+        border-left-color: #FF6B6B;
+        background-color: #fff5f5;
     }
     
     .assistant-message {
-        border-left-color: #4CAF50;
-        background-color: #1e2329;
+        border-left-color: #4ECDC4;
+        background-color: #f0fffe;
     }
     
-    .code-block {
-        background-color: #161b22;
-        border: 1px solid #30363d;
-        border-radius: 6px;
-        padding: 1rem;
+    .tool-info {
+        background-color: #e3f2fd;
+        padding: 0.8rem;
+        border-radius: 8px;
+        border-left: 4px solid #2196F3;
         margin: 0.5rem 0;
-        font-family: 'Courier New', monospace;
     }
     
-    .status-indicator {
-        width: 10px;
-        height: 10px;
-        border-radius: 50%;
-        display: inline-block;
-        margin-right: 5px;
+    .error-box {
+        background-color: #ffebee;
+        padding: 1rem;
+        border-radius: 8px;
+        border-left: 4px solid #f44336;
+        color: #c62828;
+        margin: 0.5rem 0;
     }
     
-    .status-online {
-        background-color: #4CAF50;
-    }
-    
-    .status-offline {
-        background-color: #f44336;
+    .success-box {
+        background-color: #e8f5e8;
+        padding: 1rem;
+        border-radius: 8px;
+        border-left: 4px solid #4caf50;
+        color: #2e7d32;
+        margin: 0.5rem 0;
     }
 </style>
 """, unsafe_allow_html=True)
 
-class OllamaClient:
-    def __init__(self, base_url: str = "http://localhost:11434"):
-        self.base_url = base_url
-    
-    def check_connection(self) -> bool:
-        """Check if Ollama is running"""
-        try:
-            response = requests.get(f"{self.base_url}/api/tags", timeout=5)
-            return response.status_code == 200
-        except:
-            return False
-    
-    def get_available_models(self) -> list:
-        """Get list of available models"""
-        try:
-            response = requests.get(f"{self.base_url}/api/tags", timeout=5)
-            if response.status_code == 200:
-                models = response.json().get("models", [])
-                return [model["name"] for model in models]
-            return []
-        except:
-            return []
-    
-    def generate_response(self, model: str, prompt: str, system_prompt: str = "", temperature: float = 0.1) -> str:
-        """Generate response from Ollama model"""
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "system": system_prompt,
-            "stream": False,
-            "options": {
-                "temperature": temperature,
-                "top_p": 0.9,
-                "repeat_penalty": 1.1,
-                "num_predict": 2048
-            }
-        }
+def validate_api_key(api_key):
+    """Validate Groq API key format"""
+    if not api_key:
+        return False
+    return len(api_key.strip()) > 20 and api_key.startswith('gsk_')
+
+def initialize_tools():
+    """Initialize and configure search tools"""
+    try:
+        # Wikipedia tool
+        api_tool_wiki = WikipediaAPIWrapper(
+            top_k_results=3,
+            doc_content_chars_max=2000
+        )
+        wiki = WikipediaQueryRun(
+            api_wrapper=api_tool_wiki,
+            name="wikipedia",
+            description="Search Wikipedia for factual information, definitions, and general knowledge"
+        )
         
-        try:
-            response = requests.post(
-                f"{self.base_url}/api/generate",
-                json=payload,
-                timeout=60
-            )
-            if response.status_code == 200:
-                return response.json().get("response", "")
-            else:
-                return f"Error: {response.status_code} - {response.text}"
-        except requests.exceptions.Timeout:
-            return "Error: Request timed out. The model might be taking too long to respond."
-        except Exception as e:
-            return f"Error: {str(e)}"
+        # ArXiv tool
+        api_tool_arxiv = ArxivAPIWrapper(
+            top_k_results=3,
+            doc_content_chars_max=2000
+        )
+        arxiv = ArxivQueryRun(
+            api_wrapper=api_tool_arxiv,
+            name="arxiv",
+            description="Search ArXiv for academic papers and research articles"
+        )
+        
+        # DuckDuckGo search tool
+        search = DuckDuckGoSearchRun(
+            name="web_search",
+            description="Search the web for current information, news, and recent developments"
+        )
+        
+        return [wiki, arxiv, search], None
+    except Exception as e:
+        return [], str(e)
 
-def get_system_prompt(model_type: str) -> str:
-    """Get system prompt based on model type"""
-    if "codellama" in model_type.lower() or "code" in model_type.lower():
-        return """You are CodeGuru, an expert programming assistant. You specialize in:
+def create_agent(api_key, tools):
+    """Create and configure the search agent"""
+    try:
+        llm = ChatGroq(
+            model_name="mixtral-8x7b-32768",  # Better model for complex queries
+            groq_api_key=api_key,
+            temperature=0.1,
+            max_tokens=4096
+        )
+        
+        search_agent = initialize_agent(
+            tools=tools,
+            llm=llm,
+            agent=AgentType.CHAT_ZERO_SHOT_REACT_DESCRIPTION,
+            handle_parsing_errors=True,
+            verbose=True,
+            max_iterations=5,
+            early_stopping_method="generate"
+        )
+        
+        return search_agent, None
+    except Exception as e:
+        return None, str(e)
 
-- Writing clean, efficient, and well-documented code
-- Debugging and troubleshooting code issues
-- Explaining complex programming concepts clearly
-- Providing best practices and optimization suggestions
-- Supporting multiple programming languages and frameworks
-
-Always provide:
-1. Clear, concise explanations
-2. Working code examples when relevant
-3. Best practices and potential improvements
-4. Error handling considerations
-
-Format your responses with proper code blocks and clear structure."""
+def format_response(response_text):
+    """Format and clean up the response text"""
+    if not response_text:
+        return "I apologize, but I couldn't generate a response. Please try rephrasing your question."
     
-    else:  # Default for general models like Llama 3
-        return """You are CodeGuru, a helpful programming assistant. You help with coding questions, debugging, explanations, and best practices. Provide clear, accurate, and practical advice for programming tasks."""
+    # Clean up common formatting issues
+    response_text = re.sub(r'\n\s*\n\s*\n', '\n\n', response_text)  # Remove excessive newlines
+    response_text = response_text.strip()
+    
+    return response_text
 
-def format_code_response(text: str) -> str:
-    """Format response text with proper code block highlighting"""
-    # Replace code blocks with streamlit markdown
-    code_pattern = r'```(\w+)?\n(.*?)\n```'
+def initialize_session_state():
+    """Initialize session state variables"""
+    if "messages" not in st.session_state:
+        st.session_state["messages"] = [
+            {
+                "role": "assistant", 
+                "content": "Hello! I'm your AI research assistant powered by LangChain. I can search Wikipedia, ArXiv, and the web to help you find accurate and up-to-date information. What would you like to know?"
+            }
+        ]
     
-    def replace_code_block(match):
-        language = match.group(1) or ''
-        code = match.group(2)
-        return f'\n```{language}\n{code}\n```\n'
-    
-    formatted = re.sub(code_pattern, replace_code_block, text, flags=re.DOTALL)
-    return formatted
+    if "conversation_count" not in st.session_state:
+        st.session_state["conversation_count"] = 0
 
 def main():
-    # Initialize Ollama client
-    ollama = OllamaClient()
+    # Initialize session state
+    initialize_session_state()
+    
+    # Main header
+    st.markdown('<div class="main-header">🔎 LangChain Search Agent</div>', unsafe_allow_html=True)
+    st.markdown("*Your intelligent research assistant with access to Wikipedia, ArXiv, and real-time web search*")
     
     # Sidebar configuration
-    st.sidebar.title("🤖 CodeGuru Settings")
-    
-    # Connection status
-    is_connected = ollama.check_connection()
-    status_color = "status-online" if is_connected else "status-offline"
-    status_text = "Online" if is_connected else "Offline"
-    
-    st.sidebar.markdown(
-        f'<div><span class="status-indicator {status_color}"></span>Ollama: {status_text}</div>',
-        unsafe_allow_html=True
-    )
-    
-    # Model selection
-    if is_connected:
-        available_models = ollama.get_available_models()
-        if available_models:
-            selected_model = st.sidebar.selectbox(
-                "Select Model",
-                available_models,
-                index=0
-            )
-        else:
-            st.sidebar.error("No models found. Please install a model first.")
-            st.sidebar.code("ollama pull codellama:7b")
-            return
-    else:
-        st.sidebar.error("Ollama is not running. Please start Ollama first.")
-        st.sidebar.code("ollama serve")
-        return
-    
-    # Temperature setting
-    temperature = st.sidebar.slider(
-        "Temperature",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.1,
-        step=0.1,
-        help="Lower values make responses more deterministic"
-    )
-    
-    # Clear chat button
-    if st.sidebar.button("🗑️ Clear Chat", type="secondary"):
-        st.session_state.messages = []
-        st.rerun()
-    
-    # Model info
-    with st.sidebar.expander("ℹ️ Model Information"):
-        st.write(f"**Current Model:** {selected_model}")
-        if "codellama" in selected_model.lower():
-            st.write("**Type:** Code-specialized model")
-            st.write("**Best for:** Code generation, debugging, explanations")
-        else:
-            st.write("**Type:** General-purpose model")
-            st.write("**Best for:** General coding assistance")
-    
-    # Main interface
-    st.title("💻 CodeGuru - Local Code Assistant")
-    st.markdown("*Your offline programming companion powered by Ollama*")
-    
-    # Initialize chat history
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    
-    # Display chat history
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            if message["role"] == "assistant":
-                st.markdown(format_code_response(message["content"]))
+    with st.sidebar:
+        st.title("⚙️ Configuration")
+        
+        # API Key input
+        api_key = st.text_input(
+            "Groq API Key", 
+            type="password", 
+            placeholder="gsk_...",
+            help="Get your free API key from https://console.groq.com/",
+            value=os.getenv("GROQ_API_KEY", "")
+        )
+        
+        # API key validation
+        if api_key:
+            if validate_api_key(api_key):
+                st.success("✅ Valid API key")
             else:
+                st.error("❌ Invalid API key format")
+        
+        st.markdown("---")
+        
+        # Model selection
+        model_option = st.selectbox(
+            "🤖 Select Model",
+            [
+                "mixtral-8x7b-32768",
+                "llama3-70b-8192", 
+                "llama3-8b-8192",
+                "gemma2-9b-it"
+            ],
+            help="Choose the AI model for processing your queries"
+        )
+        
+        # Search tools info
+        st.markdown("### 🛠️ Available Tools")
+        tools, error = initialize_tools()
+        
+        if error:
+            st.error(f"❌ Tool initialization error: {error}")
+        else:
+            for tool in tools:
+                st.markdown(f"✅ **{tool.name}**: {tool.description}")
+        
+        st.markdown("---")
+        
+        # Statistics
+        if st.session_state.messages:
+            st.markdown("### 📊 Session Stats")
+            st.metric("Messages", len(st.session_state.messages))
+            st.metric("Queries", st.session_state.conversation_count)
+        
+        # Clear chat button
+        if st.button("🗑️ Clear Chat", type="secondary", use_container_width=True):
+            st.session_state.messages = [st.session_state.messages[0]]  # Keep welcome message
+            st.session_state.conversation_count = 0
+            st.rerun()
+    
+    # Main chat interface
+    col1, col2 = st.columns([3, 1])
+    
+    with col2:
+        st.markdown("### 💡 Example Queries")
+        example_queries = [
+            "What's the latest in quantum computing?",
+            "Explain machine learning basics",
+            "Recent developments in renewable energy",
+            "What is the theory of relativity?",
+            "Current AI research trends"
+        ]
+        
+        for query in example_queries:
+            if st.button(query, key=f"example_{query[:10]}"):
+                st.session_state.example_query = query
+    
+    with col1:
+        # Display chat messages
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
                 st.markdown(message["content"])
+        
+        # Handle example query selection
+        if hasattr(st.session_state, 'example_query'):
+            prompt = st.session_state.example_query
+            delattr(st.session_state, 'example_query')
+        else:
+            prompt = st.chat_input(
+                placeholder="Ask me anything... (e.g., 'What are the latest developments in AI?')"
+            )
+        
+        if prompt:
+            # Validation
+            if not api_key or not validate_api_key(api_key):
+                st.error("❌ Please provide a valid Groq API key in the sidebar")
+                return
+            
+            if not tools:
+                st.error("❌ Search tools are not available. Please check your internet connection.")
+                return
+            
+            # Add user message
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            
+            # Generate response
+            with st.chat_message("assistant"):
+                try:
+                    with st.spinner("🔍 Searching and analyzing..."):
+                        # Create agent with selected model
+                        llm = ChatGroq(
+                            model_name=model_option,
+                            groq_api_key=api_key,
+                            temperature=0.1,
+                            max_tokens=4096
+                        )
+                        
+                        search_agent = initialize_agent(
+                            tools=tools,
+                            llm=llm,
+                            agent=AgentType.CHAT_ZERO_SHOT_REACT_DESCRIPTION,
+                            handle_parsing_errors=True,
+                            verbose=True,
+                            max_iterations=5,
+                            early_stopping_method="generate"
+                        )
+                        
+                        # Create callback handler
+                        st_callback = StreamlitCallbackHandler(
+                            st.container(), 
+                            expand_new_thoughts=False,
+                            collapse_completed_thoughts=True
+                        )
+                        
+                        # Get response
+                        response = search_agent.run(prompt, callbacks=[st_callback])
+                        
+                        # Format and display response
+                        formatted_response = format_response(response)
+                        st.markdown(formatted_response)
+                        
+                        # Add to session state
+                        st.session_state.messages.append({
+                            "role": "assistant", 
+                            "content": formatted_response
+                        })
+                        st.session_state.conversation_count += 1
+                        
+                except Exception as e:
+                    error_message = f"❌ An error occurred: {str(e)}"
+                    st.error(error_message)
+                    
+                    # Show detailed error in expander
+                    with st.expander("🔍 Error Details"):
+                        st.code(traceback.format_exc())
+                    
+                    # Add error to chat history
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": "I apologize, but I encountered an error while processing your request. Please try again with a different question or check your API key."
+                    })
     
-    # Chat input
-    if prompt := st.chat_input("Ask me anything about code..."):
-        # Add user message to chat history
-        st.session_state.messages.append({"role": "user", "content": prompt})
+    # Footer with tips
+    st.markdown("---")
+    with st.expander("📖 Usage Tips & Information"):
+        col1, col2 = st.columns(2)
         
-        # Display user message
-        with st.chat_message("user"):
-            st.markdown(prompt)
+        with col1:
+            st.markdown("""
+            **🎯 Best Practices:**
+            - Be specific in your questions
+            - Ask for recent information when needed
+            - Use follow-up questions for clarification
+            - Try different phrasings if needed
+            """)
         
-        # Generate response
-        with st.chat_message("assistant"):
-            with st.spinner("CodeGuru is thinking..."):
-                system_prompt = get_system_prompt(selected_model)
-                
-                # Build conversation context
-                conversation_context = ""
-                for msg in st.session_state.messages[-5:]:  # Last 5 messages for context
-                    if msg["role"] == "user":
-                        conversation_context += f"User: {msg['content']}\n"
-                    else:
-                        conversation_context += f"Assistant: {msg['content']}\n"
-                
-                conversation_context += f"User: {prompt}\nAssistant: "
-                
-                response = ollama.generate_response(
-                    model=selected_model,
-                    prompt=conversation_context,
-                    system_prompt=system_prompt,
-                    temperature=temperature
-                )
-                
-                formatted_response = format_code_response(response)
-                st.markdown(formatted_response)
+        with col2:
+            st.markdown("""
+            **🔧 Features:**
+            - Real-time web search via DuckDuckGo
+            - Academic papers from ArXiv
+            - Encyclopedia knowledge from Wikipedia
+            - Intelligent source selection
+            """)
         
-        # Add assistant response to chat history
-        st.session_state.messages.append({"role": "assistant", "content": response})
-    
-    # Footer with usage instructions
-    with st.expander("📖 Usage Tips"):
         st.markdown("""
-        **Getting Started:**
-        - Make sure Ollama is running (`ollama serve`)
-        - Install models: `ollama pull codellama:7b` or `ollama pull llama3`
-        
-        **Best Practices:**
-        - Be specific about the programming language and context
-        - Ask for code reviews, explanations, or debugging help
-        - Use lower temperature (0.1-0.3) for more consistent code generation
-        
-        **Example Prompts:**
-        - "Write a Python function to sort a list of dictionaries by a specific key"
-        - "Debug this JavaScript code: [paste your code]"
-        - "Explain how async/await works in Python"
-        - "Optimize this SQL query for better performance"
+        **⚡ Models Available:**
+        - **Mixtral-8x7b**: Best for complex research queries
+        - **Llama3-70b**: High-quality responses, slower
+        - **Llama3-8b**: Fast and efficient
+        - **Gemma2-9b**: Balanced performance
         """)
 
 if __name__ == "__main__":
